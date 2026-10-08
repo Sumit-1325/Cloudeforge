@@ -2,51 +2,29 @@ const Deployment = require("../models/Deployment");
 const Project = require("../models/Project");
 const AuditLog = require("../models/AuditLog");
 const fs = require("fs/promises");
-const net = require("net");
 const repoService = require("../services/repo.service");
 const buildService = require("../services/build.service");
-const k8sService = require("../services/k8s.service");
+const dockerService = require("../services/docker.service");
 
 const MAX_REPLICAS = 10;
 const MAX_CPU_CORES = 2; // e.g. "2" cores as a platform-enforced ceiling
 const MAX_MEMORY_MI = 2048; // 2Gi
 
-// Local-dev only. When the backend runs on the same machine as Minikube +
-// `minikube tunnel`, a LoadBalancer Service binds the requested port on the
-// host. If another local process (pgAdmin, Apache, anything) already holds
-// that port, the OS routes the tunnel's traffic to that process instead of
-// the deployed app — so deployments to such ports must be rejected up front.
-// This is irrelevant in the cloud (Phase 2 / k3s), where the Service port is
-// only bound inside the cluster, hence the LOCAL_DEV gate.
-const IS_LOCAL_DEV = process.env.LOCAL_DEV === "true";
-const SERVICE_TYPE = process.env.SERVICE_TYPE || "LoadBalancer";
+// Host used in the deployed app URL. "localhost" for local use; set it to the
+// server's public IP or domain when CloudForge runs on a VPS.
+const PUBLIC_HOST = process.env.PUBLIC_HOST || "localhost";
 
-// Tries to bind the requested port on the host. Rejects the deployment if the
-// port is already taken, so a "successful" deploy can never silently serve the
-// wrong process via the tunnel.
-//
-// Binds 0.0.0.0 (the wildcard) because that is where host processes hold the
-// port; binding 127.0.0.1 when 0.0.0.0 is taken returns EACCES on Windows
-// rather than EADDRINUSE, and the tunnel itself binds 127.0.0.1 — so both
-// codes are treated as "in use".
-function assertHostPortFree(port) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", (err) => {
-      if (err.code === "EADDRINUSE" || err.code === "EACCES") {
-        reject(
-          new Error(
-            `Port ${port} is already in use on this machine by another process. Choose a different port for this deployment.`
-          )
-        );
-      } else {
-        reject(new Error(`Could not verify port ${port} is free: ${err.message}`));
-      }
-    });
-    server.listen(port, "0.0.0.0", () => {
-      server.close(() => resolve());
-    });
-  });
+// Container group + resource limits for a deployment, in the shape the docker
+// service expects. Shared by the pipeline and every lifecycle action.
+function containerSpec(deployment) {
+  const projectName = repoService.projectNameFromRepo(deployment.project.repository);
+  return {
+    group: dockerService.containerGroup(projectName, deployment.environment || "development"),
+    image: deployment.image,
+    port: deployment.port,
+    cpus: parseCpuToCores(deployment.cpu),
+    memoryMi: parseMemoryToMi(deployment.memory),
+  };
 }
 
 function parseCpuToCores(cpu) {
@@ -94,8 +72,9 @@ async function createDeployment(req, res) {
       return res.status(400).json({ error: `memory must be a valid value up to ${MAX_MEMORY_MI}Mi` });
     }
 
-    if (port < 1 || port > 65535) {
-      return res.status(400).json({ error: "port must be between 1 and 65535" });
+    // Replica N is published on host port port + N, so the whole range must fit.
+    if (port < 1 || port + replicas - 1 > 65535) {
+      return res.status(400).json({ error: "port must be between 1 and 65535 (port + replicas - 1 must also fit)" });
     }
 
     // --- Persist as "pending" ---
@@ -129,7 +108,6 @@ async function getDeployment(req, res) {
     if (!deployment) {
       return res.status(404).json({ error: "Deployment not found" });
     }
-    // TODO (next step): merge in live pod status from k8s.service.getStatus()
     return res.status(200).json(deployment);
   } catch (err) {
     console.error("[deployment.get] ", err);
@@ -167,14 +145,12 @@ async function getLogs(req, res) {
     const deployment = await findOwnedDeployment(req, res);
     if (!deployment) return;
 
-    // No live pods yet while the pipeline is still cloning/building/deploying.
+    // No containers yet while the pipeline is still cloning/building/deploying.
     if (deployment.status !== "running") {
       return res.status(409).json({ error: "Deployment is not running yet" });
     }
 
-    const projectName = repoService.projectNameFromRepo(deployment.project.repository);
-    const namespace = deployment.environment || "development";
-    const logs = await k8sService.getLogs(projectName, namespace);
+    const logs = await dockerService.getLogs(containerSpec(deployment).group);
 
     return res.status(200).json({ logs });
   } catch (err) {
@@ -193,11 +169,18 @@ async function scaleDeployment(req, res) {
       return res.status(400).json({ error: `replicas must be between 1 and ${MAX_REPLICAS}` });
     }
 
-    const fromReplicas = deployment.replicas;
-    const projectName = repoService.projectNameFromRepo(deployment.project.repository);
-    const namespace = deployment.environment || "development";
+    if (deployment.port + replicas - 1 > 65535) {
+      return res.status(400).json({ error: "Not enough host ports above this deployment's port for that many replicas" });
+    }
 
-    await k8sService.scale(projectName, replicas, namespace);
+    const fromReplicas = deployment.replicas;
+
+    try {
+      await dockerService.scale({ ...containerSpec(deployment), replicas });
+    } catch (err) {
+      // Port conflicts / crashing replicas are user-actionable; surface them.
+      return res.status(409).json({ error: err.message });
+    }
 
     deployment.replicas = replicas;
     await deployment.save();
@@ -221,10 +204,7 @@ async function restartDeployment(req, res) {
     const deployment = await findOwnedDeployment(req, res);
     if (!deployment) return;
 
-    const projectName = repoService.projectNameFromRepo(deployment.project.repository);
-    const namespace = deployment.environment || "development";
-
-    await k8sService.restart(projectName, namespace);
+    await dockerService.restart(containerSpec(deployment).group);
 
     await AuditLog.create({
       user: req.user.id,
@@ -245,10 +225,12 @@ async function deleteDeployment(req, res) {
     const deployment = await findOwnedDeployment(req, res);
     if (!deployment) return;
 
-    const projectName = repoService.projectNameFromRepo(deployment.project.repository);
-    const namespace = deployment.environment || "development";
-
-    await k8sService.deleteDeployment(projectName, namespace);
+    // Only tear down containers this deployment still owns: a newer deploy of
+    // the same project+environment replaces the group and marks this one
+    // "stopped", and deleting the old record must not kill the new containers.
+    if (deployment.status === "running") {
+      await dockerService.removeContainers(containerSpec(deployment).group);
+    }
 
     deployment.status = "deleted";
     await deployment.save();
@@ -275,26 +257,15 @@ async function runDeploymentPipeline(deployment, project) {
   };
 
   let workspacePath = null;
+  let containersStarted = false;
+
+  // Resource name shared by the image and the containers. Sanitized so a repo
+  // like "Hello-World" yields a valid lowercase Docker image name.
+  const projectName = repoService.projectNameFromRepo(project.repository);
+  const environment = deployment.environment || "development";
+  const group = dockerService.containerGroup(projectName, environment);
 
   try {
-    // Fail fast before doing any work: pushing to Docker Hub needs the account
-    // username prefix; without it docker push fails with a confusing
-    // "insufficient_scope" error, so validate up front.
-    buildService.getRegistryUsername();
-
-    // Resource name shared by the image, Deployment and Service. Sanitized so
-    // a repo like "Hello-World" yields a valid lowercase Docker image name.
-    const projectName = repoService.projectNameFromRepo(project.repository);
-    const namespace = deployment.environment || "development";
-
-    // Local-dev pre-flight: with SERVICE_TYPE=LoadBalancer + LOCAL_DEV=true
-    // (Minikube + tunnel on this machine), the requested Service port must be
-    // free on the host or tunnel traffic will hit whatever process owns it.
-    // Fail before any clone/build work.
-    if (IS_LOCAL_DEV && SERVICE_TYPE === "LoadBalancer") {
-      await assertHostPortFree(deployment.port);
-    }
-
     // 1. Clone the repo into a per-deployment workspace folder.
     await setStatus("cloning");
     workspacePath = await repoService.cloneRepo(project.repository, deployment.branch);
@@ -307,66 +278,52 @@ async function runDeploymentPipeline(deployment, project) {
     //    no template fail fast with a clear message.
     await repoService.ensureDockerfile(workspacePath, projectType);
 
-    // 4. Build and push the container image.
+    // 4. Build the container image.
     await setStatus("building");
     const imageRef = await buildService.buildImage(workspacePath, projectName, `v${Date.now()}`);
-
-    await setStatus("pushing");
-    await buildService.pushImage(imageRef);
     deployment.image = imageRef;
     await deployment.save();
 
-    // 5. Make sure the target namespace exists before applying anything.
-    await setStatus("deploying");
-    await k8sService.ensureNamespace(namespace);
-
-    // 6. Render and apply the Deployment manifest, then a matching NodePort Service.
-    const manifest = await k8sService.renderManifest({
-      PROJECT_NAME: projectName,
-      NAMESPACE: namespace,
-      REPLICAS: deployment.replicas,
-      IMAGE: imageRef,
-      PORT: deployment.port,
-      CPU: deployment.cpu,
-      MEMORY: deployment.memory,
-      CPU_LIMIT: deployment.cpu,
-      MEMORY_LIMIT: deployment.memory,
-    });
-    await k8sService.applyManifest(manifest);
-
-    const serviceYaml = await k8sService.renderServiceManifest({
-      PROJECT_NAME: projectName,
-      NAMESPACE: namespace,
-      PORT: deployment.port,
-      SERVICE_TYPE,
-    });
-    await k8sService.applyManifest(serviceYaml);
-
-    // 7. Mark as running and expose the URL. LoadBalancer services only get an
-    //    external IP while `minikube tunnel` (or a cloud LB) is active. Poll
-    //    for it while the status stays "deploying" (the frontend keeps polling
-    //    until a terminal state), so the URL appears automatically as soon as
-    //    the tunnel assigns an address. Give up after ~90s and mark it running
-    //    with an empty url rather than staying "deploying" forever.
-    let deploymentUrl = null;
-    if (SERVICE_TYPE === "LoadBalancer") {
-      for (let attempt = 0; attempt < 18; attempt++) {
-        deploymentUrl = await k8sService.getLoadBalancerUrl(projectName, namespace, deployment.port);
-        if (deploymentUrl) break;
-        await new Promise((r) => setTimeout(r, 5000));
-      }
-    } else {
-      // NodePort fallback (e.g. SERVICE_TYPE=NodePort on a bare cluster): the
-      // URL needs the node IP.
-      const nodeIp = await k8sService.getNodeIp();
-      const nodePort = await k8sService.getNodePort(projectName, namespace);
-      deploymentUrl = `http://${nodeIp}:${nodePort}`;
+    // 5. Optionally push it to Docker Hub. Containers run on this host from
+    //    the local image, so the push is only a backup and is skipped when no
+    //    registry is configured.
+    if (buildService.isRegistryConfigured()) {
+      await setStatus("pushing");
+      await buildService.pushImage(imageRef);
     }
 
-    if (deploymentUrl) deployment.url = deploymentUrl;
+    // 6. Replace any previous containers of this project+environment, then
+    //    start one container per replica (replica N on host port port + N).
+    await setStatus("deploying");
+    await dockerService.removeContainers(group);
+    await Deployment.updateMany(
+      { project: project._id, environment, status: "running", _id: { $ne: deployment._id } },
+      { status: "stopped" }
+    );
+
+    containersStarted = true;
+    await dockerService.runReplicas({
+      group,
+      image: imageRef,
+      port: deployment.port,
+      cpus: parseCpuToCores(deployment.cpu),
+      memoryMi: parseMemoryToMi(deployment.memory),
+      fromIndex: 0,
+      toIndex: deployment.replicas,
+    });
+
+    // 7. Mark as running and expose the URL of the first replica.
+    deployment.url = `http://${PUBLIC_HOST}:${deployment.port}`;
     await setStatus("running");
   } catch (err) {
     console.error("[deployment.pipeline] ", err);
+    // Don't leave crashed or half-started replicas behind (they would hold
+    // their host ports and keep restarting).
+    if (containersStarted) {
+      await dockerService.removeContainers(group).catch((cleanupErr) => {
+        console.error("[deployment.pipeline] container cleanup failed: ", cleanupErr.message);
+      });
+    }
     await setStatus("failed", { errorMessage: err.message });
   } finally {
     // Free disk: remove the cloned workspace whether the pipeline succeeded or failed.

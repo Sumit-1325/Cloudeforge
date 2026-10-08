@@ -4,7 +4,7 @@ import client from "../api/client";
 import Layout from "../components/Layout";
 import StatusBadge from "../components/StatusBadge";
 
-const TERMINAL_STATUSES = ["running", "failed", "deleted"];
+const TERMINAL_STATUSES = ["running", "failed", "deleted", "stopped"];
 const POLL_MS = 3000;
 
 function formatDate(iso) {
@@ -118,7 +118,7 @@ export default function DeploymentDetail() {
   }
 
   async function handleRestart() {
-    if (!window.confirm("Restart this deployment? It will roll a new set of pods.")) return;
+    if (!window.confirm("Restart this deployment? All of its containers will be restarted.")) return;
     setActionError("");
     setActionLoading(true);
     try {
@@ -177,7 +177,7 @@ export default function DeploymentDetail() {
             onClick={handleRestart}
             disabled={!running || actionLoading}
             className="bg-panel border border-border text-text text-sm px-3 py-1.5 rounded hover:bg-panelhover disabled:opacity-40 disabled:cursor-not-allowed transition"
-            title={running ? "Roll new pods" : "Only available once running"}
+            title={running ? "Restart all containers" : "Only available once running"}
           >
             Restart
           </button>
@@ -252,21 +252,13 @@ export default function DeploymentDetail() {
                 >
                   {deployment.url}
                 </a>
-              ) : running ? (
-                <dd className="text-sm text-muted font-mono">
-                  Waiting for a load balancer address…
-                  <p className="text-xs text-muted mt-2 leading-relaxed">
-                    On Minikube, run{" "}
-                    <code className="font-mono text-text/80">minikube tunnel</code>{" "}
-                    in a terminal and keep it open, then refresh — the URL will
-                    appear once the tunnel assigns an address.
-                  </p>
-                </dd>
               ) : (
                 <dd className="text-sm text-muted font-mono">
                   {status === "deleted"
                     ? "Deployment deleted"
-                    : "URL will appear once the deployment is running."}
+                    : status === "stopped"
+                      ? "Replaced by a newer deployment of this project."
+                      : "URL will appear once the deployment is running."}
                 </dd>
               )}
             </div>

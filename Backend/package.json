@@ -8,7 +8,6 @@
     "dev": "nodemon src/server.js"
   },
   "dependencies": {
-    "@kubernetes/client-node": "^2.0.0",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
@@ -20,6 +19,5 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
-    
   }
 }

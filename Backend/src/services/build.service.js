@@ -15,29 +15,29 @@ const PUSH_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_BUFFER = 50 * 1024 * 1024; // 50MB of output before giving up
 const execFileAsync = promisify(execFile);
 
+// Pushing to a registry is optional: containers run on this same host, so the
+// locally built image is enough. When DOCKER_REGISTRY_USERNAME is set, images
+// are also pushed to Docker Hub as a backup/for sharing.
+//
 // Docker Hub requires a <username>/<image>:<tag> reference for pushes to a
 // personal account; without the prefix it targets the official library
 // namespace, which regular accounts cannot write to ("insufficient_scope").
-// The username comes from DOCKER_REGISTRY_USERNAME in .env.
-function getRegistryUsername() {
-  const username = process.env.DOCKER_REGISTRY_USERNAME;
-  if (!username) {
-    throw new Error("DOCKER_REGISTRY_USERNAME is not configured");
-  }
-  return username;
+function isRegistryConfigured() {
+  return Boolean(process.env.DOCKER_REGISTRY_USERNAME);
 }
 
-// Full image reference, e.g. "23106031/test-node-app:v1788606996773".
+// Full image reference: "<username>/<image>:<tag>" when pushing to Docker Hub,
+// otherwise a local-only "cloudforge/<image>:<tag>".
 function buildImageRef(imageName, tag) {
-  return `${getRegistryUsername()}/${imageName}:${tag}`;
+  const owner = isRegistryConfigured() ? process.env.DOCKER_REGISTRY_USERNAME : "cloudforge";
+  return `${owner}/${imageName}:${tag}`;
 }
 
 /**
  * Builds a Docker image from a cloned workspace directory.
  *
- * Tags the image as `<registryUsername>/<imageName>:<tag>` and builds with the
- * workspace as the build context. Assumes a Dockerfile is present in the
- * workspace root.
+ * Tags the image via buildImageRef and builds with the workspace as the build
+ * context. Assumes a Dockerfile is present in the workspace root.
  *
  * @param {string} workspacePath Absolute path to the cloned repo folder
  * @param {string} imageName     Repository/image name, e.g. "coupon-service"
@@ -58,16 +58,49 @@ async function buildImage(workspacePath, imageName, tag) {
   }
 }
 
+// docker push to Docker Hub can fail transiently on flaky connections
+// ("timeout awaiting response headers" on a blob upload). Layers that did
+// upload are kept by the registry, so each retry only re-sends what's left
+// and usually succeeds within a few attempts.
+const PUSH_ATTEMPTS = 4;
+const PUSH_RETRY_DELAY_MS = 5000;
+
+// Auth/permission failures will never succeed on retry; fail immediately.
+const NON_RETRYABLE_PUSH_ERRORS = /denied|insufficient_scope|unauthorized|authentication required/i;
+
 /**
- * Pushes a Docker image to the configured registry.
- *
- * Resolves when the docker push process exits 0, rejects with a clear message
- * if the push exceeds PUSH_TIMEOUT_MS or the process fails.
+ * Pushes a Docker image to the configured registry, retrying transient
+ * network failures up to PUSH_ATTEMPTS times.
  *
  * @param {string} imageRef Image reference to push, e.g. "23106031/coupon-service:v1"
  * @returns {Promise<string>} The pushed image reference
  */
 async function pushImage(imageRef) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await pushImageOnce(imageRef);
+    } catch (err) {
+      if (attempt >= PUSH_ATTEMPTS || NON_RETRYABLE_PUSH_ERRORS.test(err.message)) {
+        throw err;
+      }
+      console.warn(
+        `[build.pushImage] attempt ${attempt}/${PUSH_ATTEMPTS} failed, retrying in ${PUSH_RETRY_DELAY_MS / 1000}s`
+      );
+      await new Promise((r) => setTimeout(r, PUSH_RETRY_DELAY_MS));
+    }
+  }
+}
+
+/**
+ * Runs a single docker push.
+ *
+ * Resolves when the docker push process exits 0, rejects with a clear message
+ * if the push exceeds PUSH_TIMEOUT_MS or the process fails.
+ *
+ * @param {string} imageRef Image reference to push
+ * @returns {Promise<string>} The pushed image reference
+ */
+function pushImageOnce(imageRef) {
   console.log("[build.pushImage] started: " + imageRef);
 
   return new Promise((resolve, reject) => {
@@ -97,4 +130,4 @@ async function pushImage(imageRef) {
   });
 }
 
-module.exports = { buildImage, pushImage, buildImageRef, getRegistryUsername };
+module.exports = { buildImage, pushImage, buildImageRef, isRegistryConfigured };

@@ -1,12 +1,14 @@
 # CloudForge
 
 CloudForge is a self-service deployment platform: users register GitHub repos,
-and the backend clones, builds (Docker), and deploys them to a Kubernetes
-cluster (Minikube/dev), exposing the app via a NodePort URL.
+and the backend clones, builds a Docker image, and runs it as Docker
+containers on the same machine, exposing the app at `http://<host>:<port>`.
+No Kubernetes cluster is needed — only Docker.
 
 ## Repository layout
 
 - `Backend/` — Express + Mongoose API (`npm run dev` in `Backend/`)
+- `frontend/` — React + Vite UI (`npm run dev` in `frontend/`, http://localhost:3000)
 
 ## Backend quickstart
 
@@ -49,43 +51,58 @@ properly quoted body (bare `{name:...}` will be rejected with
 - `POST /api/projects`, `GET /api/projects` — create/list repos (auth)
 - `POST /api/deployments` — start a deploy (202, runs async)
 - `GET /api/deployments/:id` — poll status (`pending` → `cloning` → `building`
-  → `pushing` → `deploying` → `running`, or `failed`)
+  → `pushing` (only if a registry is configured) → `deploying` → `running`,
+  or `failed`)
 - `GET /api/deployments/:id/logs` — container logs (409 until running)
 - `POST /api/deployments/:id/scale` — `{ replicas }` (1–10)
-- `POST /api/deployments/:id/restart` — rolling restart
-- `DELETE /api/deployments/:id` — delete the Deployment
+- `POST /api/deployments/:id/restart` — restart all containers
+- `DELETE /api/deployments/:id` — remove the containers
 
-## Kubernetes notes
+## How deployments run (Docker only)
 
-- The backend expects a reachable cluster (kubeconfig). For Minikube, set
-  `NODE_IP=$(minikube ip)` so the populated `url` uses the Minikube VM IP
-  rather than a discovered node address.
-- Deployments/Services are applied into the namespace matching
-  `deployment.environment` (created if missing).
+- The pipeline clones the repo, detects the project type (`package.json` →
+  Node, `requirements.txt` → Python), and generates a Dockerfile from
+  `src/templates/dockerfiles/` if the repo has none.
+- Each project+environment gets a group of containers named
+  `cf-<project>-<environment>-1`, `-2`, ... labelled
+  `cloudforge.app=cf-<project>-<environment>` (see
+  `src/services/docker.service.js`).
+- Replica N (0-based) is published on host port `port + N`, because two
+  containers cannot share one host port. The deployment URL points at the
+  first replica: `http://<PUBLIC_HOST>:<port>`.
+- CPU/memory are applied as `docker run --cpus` / `--memory` limits, and
+  `PORT=<port>` is passed to the container.
+- Redeploying the same project+environment replaces its containers and marks
+  the previous deployment `stopped`.
+- Before starting, the pipeline checks every host port it needs is free; after
+  starting, it verifies the containers are still running, so an app that
+  crashes on boot fails the deployment with its last logs.
+
+```bash
+docker ps --filter label=cloudforge.app   # list all CloudForge containers
+```
 
 ---
 
 # Local Setup Guide (Windows)
 
-Everything needed to run CloudForge from zero on a Windows machine. This
-mirrors the actual setup used during development.
+Everything needed to run CloudForge from zero on a Windows machine.
 
 ## Required accounts
 
 - **MongoDB Atlas** (free tier) — or a local MongoDB install. Provides the
   connection string for `MONGO_URI`.
-- **Docker Hub** — free account. Your username/password go in
-  `DOCKER_REGISTRY_USERNAME` / `DOCKER_REGISTRY_PASSWORD`; images are pushed
-  to your personal namespace.
-- **GitHub** — to create the test repositories you deploy.
+- **GitHub** — to create the repositories you deploy (must be public).
+- **Docker Hub** — *optional*. Only needed if you also want built images
+  pushed to Docker Hub (set `DOCKER_REGISTRY_USERNAME` and run `docker login`).
 
 ## Required software
 
 - **Node.js** (18+; developed on 22)
-- **Docker Desktop** — includes `docker` CLI + daemon; **kubectl usually ships
-  with Docker Desktop** on Windows (`C:\Program Files\Docker\Docker\resources\bin`),
-  so a separate kubectl install is often unnecessary.
-- **Minikube** — for the local Kubernetes cluster.
+- **Git** — used to clone the repositories being deployed.
+- **Docker Desktop** — includes the `docker` CLI + engine. On Windows it needs
+  WSL 2: run `wsl --install` in an **admin** PowerShell, then restart.
+  Kubernetes does **not** need to be enabled.
 
 ## .env variables
 
@@ -97,53 +114,45 @@ Copy `Backend/.env.example` to `Backend/.env` and fill in:
 | `MONGO_URI` | **required** | MongoDB connection string (Atlas or local) |
 | `JWT_SECRET` | **required** | Secret used to sign auth tokens |
 | `JWT_EXPIRES_IN` | optional | Token lifetime (default `1d`) |
-| `DOCKER_REGISTRY_USERNAME` | **required** | Docker Hub username; images are tagged `<username>/<image>:<tag>`; pipeline fails fast if unset |
-| `DOCKER_REGISTRY_PASSWORD` | required* | Docker Hub password (only needed if you automate `docker login`) |
-| `DOCKER_REGISTRY_URL` | optional | Custom registry host (defaults to Docker Hub) |
-| `NODE_IP` | only for `SERVICE_TYPE=NodePort` | Node IP used in the deployed app URL; get it from `minikube ip` |
-| `SERVICE_TYPE` | optional | `LoadBalancer` (default) or `NodePort`. LoadBalancer works on Minikube (needs `minikube tunnel`) and k3s (ships ServiceLB/Klipper). Use NodePort only on clusters with no LoadBalancer controller |
-| `LOCAL_DEV` | only for local Minikube dev | `true` on a dev machine running Minikube + tunnel. Enables the pre-flight host-port-conflict check (gotcha g). Leave unset in the cloud |
+| `DOCKER_REGISTRY_USERNAME` | optional | Docker Hub username. If set, images are tagged `<username>/<image>:<tag>` and pushed after building; if empty, images stay local as `cloudforge/<image>:<tag>` |
+| `PUBLIC_HOST` | optional | Host used in deployed app URLs (default `localhost`; use the server's IP/domain on a VPS) |
 
 ## Setup order
 
 ```bash
-# 1. Install backend dependencies
+# 1. Start Docker Desktop and wait for "Engine running"
+docker info
+
+# 2. Backend
 cd Backend
 npm install
+cp .env.example .env     # fill in MONGO_URI and JWT_SECRET
+npm run dev              # -> http://localhost:5000
 
-# 2. Create and fill .env (see table above)
-cp .env.example .env
+# 3. Frontend (second terminal)
+cd frontend
+npm install
+npm run dev              # -> http://localhost:3000
 
-# 3. Log in to Docker Hub so docker push is authenticated
-docker login
-
-# 4. Start Minikube (Docker driver) and confirm kubectl sees it
-minikube start --driver=docker
-kubectl get nodes        # -> minikube Ready
-
-# 5. Get the Minikube VM IP and put it in .env as NODE_IP
-minikube ip              # e.g. 192.168.49.2 -> NODE_IP=192.168.49.2
-#    (NODE_IP is only used if SERVICE_TYPE=NodePort; not needed for the
-#    default LoadBalancer setup)
-
-# 6. Start minikube tunnel in a SEPARATE terminal and leave it open
-minikube tunnel          # keeps running; assigns LoadBalancer IPs (127.0.0.1)
-#    One tunnel serves ALL deployments — no per-deployment commands needed.
-#    If it prompts for admin credentials, approve the UAC prompt.
-
-# 7. Start the backend
-npm run dev              # nodemon -> http://localhost:5000
+# 4. (Optional) only if DOCKER_REGISTRY_USERNAME is set
+docker login -u <your-docker-hub-username>   # use an access token as password
 ```
 
-> **About `minikube tunnel`:** each deployment creates a `LoadBalancer` Service.
-> `minikube tunnel` (run once, kept open in its own terminal) gives every one
-> of those Services an external IP (`127.0.0.1`) and forwards ports to your
-> host, so every deployment's URL is directly clickable. It must be running
-> **before** you create deployments — if it isn't, the deployment stays
-> `deploying` for ~90s while the pipeline waits for an address, then flips to
-> `running` with an empty URL and a note that the tunnel is required.
+## Deploying an app
 
-## Known Windows-specific gotchas
+1. Register / log in at http://localhost:3000.
+2. **New Project** — paste a public GitHub repo URL
+   (`https://github.com/<owner>/<repo>`, no trailing `/` or `.git`).
+3. **Create Deployment** — choose branch, environment, replicas, CPU, memory
+   and the **port your app listens on**.
+4. Watch the status reach `running`, then open the URL.
+
+Example repos that deploy without a Dockerfile:
+
+- https://github.com/Sumit-1325/cloudforge-sample-frontend — Node, port `8080`
+- https://github.com/Sumit-1325/cloudforge-sample-python — Flask, port `8000`
+
+## Known gotchas
 
 a) **nodemon watches `workspace/`** — `npm run dev` restarts on file changes,
    and the clone step writes into `Backend/workspace/`. Without the ignore
@@ -152,57 +161,30 @@ a) **nodemon watches `workspace/`** — `npm run dev` restarts on file changes,
    this — do not remove it**, and add any new runtime-written directory to its
    `ignore` list.
 
-b) **Docker image refs need your username prefix** — images must be
-   `<username>/<image>:<tag>`. Without the prefix, `docker push` targets the
-   official library namespace and fails with `insufficient_scope:
-   authorization failed`. The pipeline tags correctly via
-   `DOCKER_REGISTRY_USERNAME`; make sure it is set.
+b) **Pick a free port** — the app's port is published on this machine, so it
+   must not be used by anything else (the CloudForge UI uses `3000`, the API
+   `5000`). With N replicas, ports `port` … `port + N - 1` must all be free.
+   The pipeline checks this and fails with "Port N is already in use on this
+   machine by another process" instead of serving the wrong app.
 
-c) **`docker push` needs an active login** — the pipeline does not automate
-   `docker login`. Run `docker login` once per session or the push fails with
-   an authentication error (wrapped as `Failed to push image ...`).
+c) **The app must listen on the deployment's port, on `0.0.0.0`** — CloudForge
+   maps host `port` → container `port` and sets `PORT=<port>` in the container.
+   An app bound to `127.0.0.1` inside the container is unreachable.
 
-d) **Stale Minikube kubeconfig after sleep/resume** — on Windows with the
-   Docker driver the kubeconfig can go stale after idle, causing
-   `ECONNREFUSED` from the Kubernetes client. Fix: `minikube update-context`.
-   If that doesn't help: `minikube stop`, then `minikube start`, then
-   re-check `minikube ip` in case it changed and update `NODE_IP` in `.env`.
+d) **Generated Dockerfiles are generic** — the Node template runs
+   `npm install --omit=dev` + `npm start`; the Python template runs
+   `pip install -r requirements.txt` + `python app.py`. Frameworks that need a
+   build step (e.g. Next.js) need their own `Dockerfile` in the repo.
 
-e) **Direct NodePort URLs are unreachable from the Windows host — use the
-   tunnel** — with the Docker driver, `http://<minikube-ip>:<nodePort>` is
-   frequently NOT directly open from the host browser due to how the driver
-   networks the VM. CloudForge avoids this by defaulting to `LoadBalancer`
-   Services: run `minikube tunnel` once (own terminal, kept open) and every
-   deployment gets a working `http://127.0.0.1:<port>` URL — no per-deployment
-   `minikube service --url` needed. If the tunnel is not running when a
-   deployment finishes building, the deployment stays `deploying` for ~90s
-   while the pipeline polls for a load balancer address, then flips to
-   `running` with an empty URL; start the tunnel and the URL appears after a
-   re-deploy or page reload.
-
-f) **Phase 2 (k3s) keeps working** — k3s ships its own LoadBalancer
-   controller (ServiceLB, formerly Klipper), so `LoadBalancer` Services get an
-   IP on a bare k3s VM too. Only clusters with *no* LoadBalancer controller at
-   all need `SERVICE_TYPE=NodePort`.
-
-g) **Host processes can hijack tunnel ports** — on a local Minikube + tunnel
-   setup, a LoadBalancer Service's port is bound on the *host* by the tunnel.
-   If any other host process (pgAdmin, Apache, a dev server — not just other
-   CloudForge deployments) already listens on that port, the OS silently
-   routes the tunnel's traffic to that process, so the deployment's URL serves
-   the wrong application. CloudForge guards against this when
-   `LOCAL_DEV=true` and `SERVICE_TYPE=LoadBalancer`: the pipeline checks the
-   requested port is free on the host (a `net.createServer().listen()` bind
-   test — no shelling out to netstat) and fails the deployment immediately
-   with "Port N is already in use on this machine by another process. Choose
-   a different port for this deployment." This only applies to local dev; on a
-   cloud cluster the Service port is bound inside the cluster, never on the
-   backend host, so the check is disabled there.
+e) **Docker Hub pushes on a slow connection** — when a registry is configured,
+   `docker push` is retried automatically (up to 4 attempts) because uploads
+   can time out with `timeout awaiting response headers`. Auth errors
+   (`insufficient_scope`, `denied`) are not retried: check the username in
+   `.env` matches your Docker Hub account and that `docker login` succeeded.
 
 ## How to verify it's working
 
-With the backend running and a cluster up, exercise the API end-to-end
-(register -> project -> deploy -> poll -> kubectl -> tunnel):
+With the backend running, exercise the API end-to-end:
 
 ```bash
 # 1. Register a user, capture the token
@@ -213,28 +195,31 @@ curl -X POST http://localhost:5000/api/auth/register -H "Content-Type: applicati
 # 2. Create a project pointing at a small public repo
 curl -X POST http://localhost:5000/api/projects -H "Authorization: Bearer <TOKEN>" \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"Demo\",\"repository\":\"https://github.com/octocat/Hello-World\"}"
+  -d "{\"name\":\"Demo\",\"repository\":\"https://github.com/Sumit-1325/cloudforge-sample-frontend\"}"
 # -> 201 {"_id":"...","name":"Demo",...}   (note the project _id)
 
 # 3. Create a deployment
 curl -X POST http://localhost:5000/api/deployments -H "Authorization: Bearer <TOKEN>" \
   -H "Content-Type: application/json" \
-  -d "{\"projectId\":\"<PROJECT_ID>\",\"branch\":\"master\",\"replicas\":1,\"cpu\":\"250m\",\"memory\":\"256Mi\",\"port\":8080}"
+  -d "{\"projectId\":\"<PROJECT_ID>\",\"branch\":\"main\",\"replicas\":1,\"cpu\":\"250m\",\"memory\":\"256Mi\",\"port\":8080}"
 # -> 202 {"deploymentId":"...","status":"pending"}   (pipeline runs in the background)
 
 # 4. Poll status until "running" (or "failed" + errorMessage)
 curl http://localhost:5000/api/deployments/<DEPLOYMENT_ID> -H "Authorization: Bearer <TOKEN>"
-# -> status moves pending -> cloning -> building -> pushing -> deploying -> running
+# -> status moves pending -> cloning -> building -> deploying -> running
 
-# 5. Confirm the pod is up in the cluster
-kubectl get pods -n development
+# 5. Confirm the container is up and open the app
+docker ps --filter label=cloudforge.app
+# -> browse to the deployment's "url", e.g. http://localhost:8080
+```
 
-# 6. Open the deployment's URL from the API response — it is directly
-#    clickable because minikube tunnel is running (step 6 of setup).
-curl http://localhost:5000/api/deployments/<DEPLOYMENT_ID> -H "Authorization: Bearer <TOKEN>"
-# -> {"url":"http://127.0.0.1:3xxxx", ...} — browse to that URL
+Or run the scripted end-to-end check (deploy, logs, scale to 3, restart,
+delete) against the running backend:
+
+```bash
+cd Backend
+node scripts/test-lifecycle.js
 ```
 
 If step 4 ends in `failed`, the `errorMessage` field on the deployment says
-why (bad repo URL, missing `DOCKER_REGISTRY_USERNAME`, docker not logged in,
-push timeout, etc.).
+why (bad repo URL, port in use, app crashed on start, push failure, etc.).

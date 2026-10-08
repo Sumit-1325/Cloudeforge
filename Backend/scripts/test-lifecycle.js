@@ -1,30 +1,32 @@
 // Integration-style lifecycle test for CloudForge deployments.
 //
-// Usage (requires a running backend + a live Kubernetes cluster, e.g. Minikube):
+// Usage (requires a running backend + a running Docker engine):
 //   1. Start the backend:  npm run dev   (or node src/server.js)
-//   2. Ensure a cluster is reachable: kubectl config current-context
+//   2. Ensure Docker is up: docker info
 //   3. Run:               node scripts/test-lifecycle.js
 //
 // Flow: register user -> create project -> create deployment ->
-//       poll until "running" -> fetch logs -> scale to 3 -> verify via
-//       k8s getStatus -> restart -> delete -> confirm status "deleted".
+//       poll until "running" -> fetch logs -> scale to 3 -> verify 3
+//       containers exist -> restart -> delete -> confirm status "deleted".
 //
 // This is a plain console.log checkpoint script, matching the style of
-// test-repo-service.js / test-k8s-render.js — not a formal test framework.
+// test-repo-service.js — not a formal test framework.
 
 const BASE_URL = process.env.CLOUDFORGE_BASE_URL || "http://localhost:5000";
-const REPO_URL = process.env.CLOUDFORGE_REPO_URL || "https://github.com/octocat/Hello-World";
-const BRANCH = process.env.CLOUDFORGE_BRANCH || "master";
+const REPO_URL = process.env.CLOUDFORGE_REPO_URL || "https://github.com/Sumit-1325/cloudforge-sample-frontend";
+const BRANCH = process.env.CLOUDFORGE_BRANCH || "main";
 
 const { spawnSync } = require("child_process");
+const dockerService = require("../src/services/docker.service");
+const { projectNameFromRepo } = require("../src/services/repo.service");
 
-function checkCluster() {
-  const ctx = spawnSync("kubectl", ["config", "current-context"], { encoding: "utf8" });
-  if (ctx.status !== 0 || !ctx.stdout.trim()) {
-    console.error("PRECONDITION FAIL: no Kubernetes context. Start Minikube (minikube start) and point kubectl at it.");
+function checkDocker() {
+  const info = spawnSync("docker", ["info", "--format", "{{.ServerVersion}}"], { encoding: "utf8" });
+  if (info.status !== 0 || !info.stdout.trim()) {
+    console.error("PRECONDITION FAIL: Docker engine not reachable. Start Docker Desktop (or the docker service).");
     process.exit(1);
   }
-  console.log(`Using kubectl context: ${ctx.stdout.trim()}`);
+  console.log(`Using Docker engine ${info.stdout.trim()}`);
 }
 
 async function api(method, path, { token, body } = {}) {
@@ -52,7 +54,7 @@ const step = (name, ok, extra = "") => {
 
 (async () => {
   try {
-    checkCluster();
+    checkDocker();
 
     const email = `lifecycle-${Date.now()}@example.com`;
     const password = "testpass123";
@@ -123,7 +125,7 @@ const step = (name, ok, extra = "") => {
     step("fetch logs (200)", logs.status === 200, logs.status === 200 ? `"${(logs.data?.logs || "").slice(0, 80)}..."` : JSON.stringify(logs.data));
     if (logs.status !== 200) throw new Error("could not fetch logs");
 
-    // 6. Scale to 3 and confirm the deployment doc + live cluster both show 3.
+    // 6. Scale to 3 and confirm 3 containers are running for the deployment.
     const scaled = await api("POST", `/api/deployments/${deploymentId}/scale`, {
       token,
       body: { replicas: 3 },
@@ -131,11 +133,10 @@ const step = (name, ok, extra = "") => {
     step("scale to 3 (200)", scaled.status === 200, JSON.stringify(scaled.data));
     if (scaled.status !== 200) throw new Error("could not scale");
 
-    const projectName = REPO_URL.split("/").pop().replace(/\.git$/, "");
-    const ns = "development";
-    const live = await require("../src/services/k8s.service").getStatus(projectName, ns);
-    step("cluster replicas == 3", live.spec?.replicas === 3, `spec.replicas=${live.spec?.replicas}`);
-    if (live.spec?.replicas !== 3) throw new Error("cluster did not scale to 3");
+    const group = dockerService.containerGroup(projectNameFromRepo(REPO_URL), "development");
+    const containers = await dockerService.listContainers(group);
+    step("containers == 3", containers.length === 3, containers.join(", "));
+    if (containers.length !== 3) throw new Error("did not scale to 3 containers");
 
     // 7. Restart.
     const restarted = await api("POST", `/api/deployments/${deploymentId}/restart`, { token });
