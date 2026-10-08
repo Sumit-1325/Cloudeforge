@@ -152,6 +152,41 @@ Example repos that deploy without a Dockerfile:
 - https://github.com/Sumit-1325/cloudforge-sample-frontend — Node, port `8080`
 - https://github.com/Sumit-1325/cloudforge-sample-python — Flask, port `8000`
 
+## Faster builds and less disk space
+
+Most of the deploy time on a slow connection is downloading base images and
+uploading to Docker Hub — not the build itself.
+
+1. **Skip Docker Hub** — leave `DOCKER_REGISTRY_USERNAME` empty in
+   `Backend/.env`. Images stay local and the slow `pushing` step disappears.
+2. **Pre-download the base images once** (later builds reuse them):
+   ```bash
+   docker pull node:20-alpine
+   docker pull python:3.12-slim
+   ```
+3. **Add a `.dockerignore` to the apps you deploy** so `node_modules`, `.git`,
+   build output, etc. are not sent into the build:
+   ```
+   node_modules
+   .git
+   .next
+   dist
+   __pycache__
+   ```
+4. **Keep repos small and use multi-stage Dockerfiles** for apps with a build
+   step (e.g. Next.js with `output: "standalone"`) — this cut one test image
+   from 926 MB to 306 MB.
+5. **Give Docker more CPU/RAM** — Docker Desktop → Settings → Resources (on
+   WSL 2, set `processors=` / `memory=` in `%UserProfile%\.wslconfig`, then
+   `wsl --shutdown`).
+6. **Do not enable Kubernetes in Docker Desktop** — CloudForge doesn't use it,
+   and it takes ~2 GB of disk plus RAM.
+7. **Free disk space now and then**:
+   ```bash
+   docker image prune -a      # remove images not used by any container
+   docker builder prune       # clear the build cache
+   ```
+
 ## Known gotchas
 
 a) **nodemon watches `workspace/`** — `npm run dev` restarts on file changes,
